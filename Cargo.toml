@@ -1,0 +1,10 @@
+[package]
+name = "screenshooter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+dbus = "0.9.7"
+pipewire = "0.8.0"
+png = "0.17.16"
