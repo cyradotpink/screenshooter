@@ -1,0 +1,1 @@
+A basic XDG Desktop Portal [ScreenCast API](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html) client example in Rust (Including the [PipeWire](https://docs.pipewire.org/index.html) bits).

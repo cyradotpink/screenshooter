@@ -10,9 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use dbus::arg::RefArg as _;
-use dbus::channel::Sender as _;
-
+use dbus::{arg::RefArg as _, channel::Sender as _};
 use pipewire::spa;
 
 type DbusBoxDynVariant = dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>;
@@ -20,6 +18,13 @@ type DbusBoxDynMap = HashMap<String, DbusBoxDynVariant>;
 
 type DbusRefDynVariant<'a> = dbus::arg::Variant<&'a dyn dbus::arg::RefArg>;
 type DbusRefDynMap<'a> = HashMap<String, DbusRefDynVariant<'a>>;
+
+#[allow(unused)]
+mod source_types {
+    pub const MONITOR: u32 = 1;
+    pub const WINDOW: u32 = 2;
+    pub const VIRTUAL: u32 = 4;
+}
 
 fn new_screen_cast_call(method: &str) -> Result<dbus::Message, anyhow::Error> {
     dbus::Message::new_method_call(
@@ -46,6 +51,8 @@ fn array_to_dynmap<'a>(
     Some(map)
 }
 
+// Since we're making requests and awaiting their responses completely
+// sequentially, we don't need to worry about matching responses to requests.
 fn get_next_portal_response(
     conn: &dbus::blocking::Connection,
     timeout: Duration,
@@ -71,7 +78,9 @@ fn get_next_portal_response(
     Ok(results)
 }
 
-fn get_next_dbus_reply(
+// Since we're making requests and awaiting their responses completely
+// sequentially, we don't need to worry about matching returns to calls.
+fn get_next_dbus_return(
     conn: &dbus::blocking::Connection,
     timeout: Duration,
 ) -> Result<dbus::Message, anyhow::Error> {
@@ -109,7 +118,12 @@ fn get_pipewire_stream(conn: &dbus::blocking::Connection) -> Result<(u32, OwnedF
     let session_handle = dbus::Path::from_slice(session_handle).map_err(|e| anyhow!(e))?;
 
     let mut req_options = DbusBoxDynMap::new();
-    req_options.insert("types".to_owned(), dbus::arg::Variant(Box::new(2u32))); // window
+    req_options.insert(
+        "types".to_owned(),
+        dbus::arg::Variant(Box::new(
+            source_types::MONITOR | source_types::WINDOW | source_types::VIRTUAL,
+        )),
+    );
     let req_msg = new_screen_cast_call("SelectSources")?.append2(&session_handle, req_options);
     conn.send(req_msg)
         .map_err(|_| anyhow!("Failed to send message"))?;
@@ -143,7 +157,7 @@ fn get_pipewire_stream(conn: &dbus::blocking::Connection) -> Result<(u32, OwnedF
         new_screen_cast_call("OpenPipeWireRemote")?.append2(&session_handle, DbusBoxDynMap::new());
     conn.send(req_msg)
         .map_err(|_| anyhow!("Failed to send message"))?;
-    let res_msg = get_next_dbus_reply(conn, Duration::from_secs(1))?;
+    let res_msg = get_next_dbus_return(conn, Duration::from_secs(1))?;
     let file: std::fs::File = res_msg.get1().ok_or(anyhow!("no fd in return"))?;
     Ok((node_id, file.into()))
 }
@@ -155,6 +169,7 @@ struct LatestFrame {
     ts: Instant,
 }
 impl LatestFrame {
+    // Take the frame's data (leaving it empty), copying only its info and timestamp.
     fn take(&mut self) -> Self {
         let mut out = Self {
             data: Vec::new(),
@@ -213,15 +228,10 @@ impl ScreenshooterSetup {
             ),
             spa::pod::property!(
                 spa::param::format::FormatProperties::VideoFormat,
-                Id,
-                spa::param::video::VideoFormat::BGRA
+                Choice, Enum, Id,
+                spa::param::video::VideoFormat::RGBA,
+                spa::param::video::VideoFormat::BGRA,
             ),
-            // spa::pod::property!(
-            //     spa::param::format::FormatProperties::VideoFormat,
-            //     Choice, Enum, Id,
-            //     spa::param::video::VideoFormat::RGBx,
-            //     spa::param::video::VideoFormat::BGRx,
-            // ),
         };
 
         let pod_value = spa::pod::Value::Object(pod_object);
@@ -371,43 +381,51 @@ impl Screenshooter {
     fn is_quit(&self) -> bool {
         self.quit.load(atomic::Ordering::Acquire)
     }
+    fn reqister_quit_notify(&self, thread: thread::Thread) {
+        self.quit_notify.lock().unwrap().insert(thread.id(), thread);
+    }
+    #[allow(unused)]
+    fn unregister_quit_notify(&self, thread: thread::Thread) {
+        self.quit_notify.lock().unwrap().remove(&thread.id());
+    }
 }
 
-fn sleep_or_wait_for_quit(shooter: &Screenshooter, mut timeout: Duration) {
+// Repeatedly parks the current thread until the timeout is reached (then returns false) or shooter.is_quit() is
+// true after an unpark (then returns true). This function does *not* ensure that that the current thread is
+// actually unparked on shooter quit. You must register the thread in shooter.quit_notify yourself.
+fn park_until_quit_w_timeout(shooter: &Screenshooter, mut timeout: Duration) -> bool {
     let mut before_park = Instant::now();
     loop {
         thread::park_timeout(timeout);
         if shooter.is_quit() {
-            break;
+            break true;
         }
         let now = Instant::now();
-        let diff = now - before_park;
-        if diff >= timeout {
-            break;
+        let elapsed = now - before_park;
+        if elapsed >= timeout {
+            break false;
         }
-        timeout -= diff;
+        timeout -= elapsed;
         before_park = now;
     }
 }
 
+// Let the user select a window to capture, then try to grab the latest captured frame every 5 seconds
+// and save it as screenshot.png.
 fn main() -> Result<(), anyhow::Error> {
     let shooter = Screenshooter::new()?;
-    let cur_thread = thread::current();
-    shooter
-        .quit_notify
-        .lock()
-        .unwrap()
-        .insert(cur_thread.id(), cur_thread);
+    shooter.reqister_quit_notify(thread::current());
 
     while !shooter.is_quit() {
         let mut frame = shooter.latest_frame.lock().unwrap().take();
-        if frame.data.len() == 0 {
-            sleep_or_wait_for_quit(&shooter, Duration::from_secs(5));
+        if frame.data.is_empty() {
+            park_until_quit_w_timeout(&shooter, Duration::from_secs(5));
             continue;
         }
-        for px in frame.data.chunks_mut(4) {
-            px.swap(0, 2);
-            // px[3] = 255;
+        if frame.info.format() == spa::param::video::VideoFormat::BGRA {
+            for px in frame.data.chunks_mut(4) {
+                px.swap(0, 2);
+            }
         }
         let f = std::fs::File::create("screenshot.png").unwrap();
         let mut enc = png::Encoder::new(f, frame.info.size().width, frame.info.size().height);
@@ -416,7 +434,7 @@ fn main() -> Result<(), anyhow::Error> {
         writer.write_image_data(&frame.data).unwrap();
         writer.finish().unwrap();
 
-        sleep_or_wait_for_quit(&shooter, Duration::from_secs(5));
+        park_until_quit_w_timeout(&shooter, Duration::from_secs(5));
     }
 
     Ok(())
