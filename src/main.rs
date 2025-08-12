@@ -1,5 +1,7 @@
 #![feature(try_blocks)]
 
+mod dbus_util;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::os::fd::OwnedFd;
@@ -10,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use dbus::{arg::RefArg as _, channel::Sender as _};
+use dbus::arg::RefArg as _;
 use pipewire::spa;
 
 type DbusBoxDynVariant = dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>;
@@ -24,6 +26,20 @@ mod source_types {
     pub const MONITOR: u32 = 1;
     pub const WINDOW: u32 = 2;
     pub const VIRTUAL: u32 = 4;
+}
+
+struct DbusBoxDynMapBuilder(DbusBoxDynMap);
+impl DbusBoxDynMapBuilder {
+    fn new() -> Self {
+        Self(DbusBoxDynMap::new())
+    }
+    fn with_owned<T: dbus::arg::RefArg + 'static>(mut self, key: String, value: T) -> Self {
+        self.0.insert(key, dbus::arg::Variant(Box::new(value)));
+        self
+    }
+    fn build(self) -> DbusBoxDynMap {
+        self.0
+    }
 }
 
 fn new_screen_cast_call(method: &str) -> Result<dbus::Message, anyhow::Error> {
@@ -51,26 +67,28 @@ fn array_to_dynmap<'a>(
     Some(map)
 }
 
-// Since we're making requests and awaiting their responses completely
-// sequentially, we don't need to worry about matching responses to requests.
 fn get_next_portal_response(
-    conn: &dbus::blocking::Connection,
+    conn: &mut dbus_util::Connection2,
+    request_token: &str,
     timeout: Duration,
 ) -> Result<DbusBoxDynMap, anyhow::Error> {
-    let at_begin = Instant::now();
-    let res_msg = loop {
-        let remaining_timeout = timeout - (Instant::now() - at_begin);
-        let msg = conn
-            .channel()
-            .blocking_pop_message(remaining_timeout)?
-            .ok_or(anyhow!("Didn't receive response"))?;
-        if msg.msg_type() == dbus::MessageType::Signal
-            && msg.interface().as_deref() == Some("org.freedesktop.portal.Request")
-            && msg.member().as_deref() == Some("Response")
-        {
-            break msg;
-        }
-    };
+    // For backwards compatibility, we're supposed to check the method call reply
+    // to make sure the request handle path was actually constructed with our chosen token.
+    // I don't wanna do that :3
+    let matcher = dbus_util::Matcher::new()
+        .with_message_type(dbus::MessageType::Signal)
+        .with_path(format!(
+            "/org/freedesktop/portal/desktop/request/{}/{}",
+            conn.conn.unique_name()[1..].replace(".", "_"),
+            request_token
+        ))
+        .with_interface("org.freedesktop.portal.Request".to_owned())
+        .with_member("Response".to_owned());
+    let id = conn.register_matcher(1, matcher);
+    let res_msg = conn
+        .block_on_once_matcher_remove(id, timeout)?
+        .1
+        .ok_or(anyhow!("Timed out waiting for response"))?;
     let (response, results) = res_msg.read2::<u32, DbusBoxDynMap>()?;
     if response != 0 {
         return Err(anyhow!("Non-zero response code {response}"));
@@ -78,61 +96,54 @@ fn get_next_portal_response(
     Ok(results)
 }
 
-// Since we're making requests and awaiting their responses completely
-// sequentially, we don't need to worry about matching returns to calls.
-fn get_next_dbus_return(
-    conn: &dbus::blocking::Connection,
+fn get_dbus_reply(
+    conn: &mut dbus_util::Connection2,
+    serial: u32,
     timeout: Duration,
 ) -> Result<dbus::Message, anyhow::Error> {
-    let at_begin = Instant::now();
-    let res_msg = loop {
-        let remaining_timeout = timeout - (Instant::now() - at_begin);
-        let msg = conn
-            .channel()
-            .blocking_pop_message(remaining_timeout)?
-            .ok_or(anyhow!("Didn't receive reply"))?;
-        if msg.msg_type() == dbus::MessageType::Error {
-            return Err(anyhow!("Received error message: {msg:?}"));
-        }
-        if msg.msg_type() == dbus::MessageType::MethodReturn {
-            break msg;
-        }
-    };
+    let matcher = dbus_util::Matcher::new().with_reply_serial(serial);
+    let id = conn.register_matcher(1, matcher);
+    let res_msg = conn
+        .block_on_once_matcher_remove(id, timeout)?
+        .1
+        .ok_or(anyhow!("Timed out waiting for reply"))?;
     Ok(res_msg)
 }
 
-fn get_pipewire_stream(conn: &dbus::blocking::Connection) -> Result<(u32, OwnedFd), anyhow::Error> {
-    let mut req_options = DbusBoxDynMap::new();
-    req_options.insert(
-        "session_handle_token".to_owned(),
-        dbus::arg::Variant(Box::new("1".to_owned())),
-    );
+fn get_pipewire_stream(conn: &mut dbus_util::Connection2) -> Result<(u32, OwnedFd), anyhow::Error> {
+    let req_options = DbusBoxDynMapBuilder::new()
+        .with_owned("handle_token".to_owned(), "req0".to_owned())
+        .with_owned("session_handle_token".to_owned(), "session0".to_owned())
+        .build();
     let req_msg = new_screen_cast_call("CreateSession")?.append1(req_options);
     conn.send(req_msg)
         .map_err(|_| anyhow!("Failed to send message"))?;
-    let results = get_next_portal_response(conn, Duration::from_secs(1))?;
+    let results = get_next_portal_response(conn, "req0", Duration::from_secs(1))?;
     let session_handle = results
         .get("session_handle")
         .and_then(|v| v.as_str())
         .ok_or(anyhow!("no session handle in response"))?;
     let session_handle = dbus::Path::from_slice(session_handle).map_err(|e| anyhow!(e))?;
 
-    let mut req_options = DbusBoxDynMap::new();
-    req_options.insert(
-        "types".to_owned(),
-        dbus::arg::Variant(Box::new(
+    let req_options = DbusBoxDynMapBuilder::new()
+        .with_owned("handle_token".to_owned(), "req1".to_owned())
+        .with_owned(
+            "types".to_owned(),
             source_types::MONITOR | source_types::WINDOW | source_types::VIRTUAL,
-        )),
-    );
+        )
+        .build();
     let req_msg = new_screen_cast_call("SelectSources")?.append2(&session_handle, req_options);
     conn.send(req_msg)
         .map_err(|_| anyhow!("Failed to send message"))?;
-    let _results = get_next_portal_response(conn, Duration::from_secs(1))?;
+    let _results = get_next_portal_response(conn, "req1", Duration::from_secs(1))?;
 
-    let req_msg = new_screen_cast_call("Start")?.append3(&session_handle, "", DbusBoxDynMap::new());
+    let req_options = DbusBoxDynMapBuilder::new()
+        .with_owned("handle_token".to_owned(), "req2".to_owned())
+        .build();
+    let req_msg = new_screen_cast_call("Start")?.append3(&session_handle, "", req_options);
     conn.send(req_msg)
         .map_err(|_| anyhow!("Failed to send message"))?;
-    let results = get_next_portal_response(conn, Duration::from_secs(5 * 60))?;
+    let results = get_next_portal_response(conn, "req2", Duration::from_secs(5 * 60))?;
     let stream: Option<_> = try {
         results
             .get("streams")?
@@ -155,9 +166,10 @@ fn get_pipewire_stream(conn: &dbus::blocking::Connection) -> Result<(u32, OwnedF
 
     let req_msg =
         new_screen_cast_call("OpenPipeWireRemote")?.append2(&session_handle, DbusBoxDynMap::new());
-    conn.send(req_msg)
+    let serial = conn
+        .send(req_msg)
         .map_err(|_| anyhow!("Failed to send message"))?;
-    let res_msg = get_next_dbus_return(conn, Duration::from_secs(1))?;
+    let res_msg = get_dbus_reply(conn, serial, Duration::from_secs(1))?;
     let file: std::fs::File = res_msg.get1().ok_or(anyhow!("no fd in return"))?;
     Ok((node_id, file.into()))
 }
@@ -189,7 +201,7 @@ struct UserData {
 
 #[allow(unused)]
 struct ScreenshooterSetup {
-    dbus_conn: dbus::blocking::Connection,
+    dbus_conn: dbus_util::Connection2,
     pw_loop: pipewire::main_loop::MainLoop,
     pw_ctx: pipewire::context::Context,
     pw_core: pipewire::core::Core,
@@ -202,7 +214,8 @@ impl ScreenshooterSetup {
         quit: Arc<AtomicBool>,
     ) -> Result<Self, anyhow::Error> {
         let dbus_conn = dbus::blocking::Connection::new_session()?;
-        let (node_id, fd) = get_pipewire_stream(&dbus_conn)?;
+        let mut dbus_conn = dbus_util::Connection2::new(dbus_conn);
+        let (node_id, fd) = get_pipewire_stream(&mut dbus_conn)?;
 
         let pw_loop = pipewire::main_loop::MainLoop::new(None)?;
         let pw_ctx = pipewire::context::Context::new(&pw_loop)?;
@@ -366,6 +379,7 @@ impl Screenshooter {
         });
         let mut result = Ok(());
         std::mem::swap(&mut *init.wait().try_lock().unwrap(), &mut result);
+        result?;
 
         Ok(Self {
             handle,
