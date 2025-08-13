@@ -54,7 +54,8 @@ impl Matcher {
 pub struct Connection2 {
     pub conn: Connection,
     next_matcher_id: usize,
-    matchers: HashMap<usize, (usize, Matcher, Vec<Message>)>,
+    next_token: u64,
+    pub matchers: HashMap<usize, (usize, Matcher, Vec<Message>)>,
     unmatched_n: usize,
 }
 impl Connection2 {
@@ -62,6 +63,7 @@ impl Connection2 {
         Self {
             conn,
             next_matcher_id: 0,
+            next_token: 0,
             matchers: HashMap::new(),
             unmatched_n: 0,
         }
@@ -70,6 +72,11 @@ impl Connection2 {
         let id = self.next_matcher_id;
         self.next_matcher_id += 1;
         id
+    }
+    pub fn get_token(&mut self) -> u64 {
+        let token = self.next_token;
+        self.next_token += 1;
+        token
     }
     pub fn send(&self, message: Message) -> Result<u32, ()> {
         self.conn.send(message)
