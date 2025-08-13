@@ -74,13 +74,16 @@ fn get_portal_response(
     timeout: Duration,
 ) -> Result<DbusBoxDynMap, anyhow::Error> {
     // We controlled the path of the request handle by passing a "token"
-    // call, which will we be used as the last segment of the path, ...
+    // call, which will we be used as the last segment of the path, ...(1)
     let predicted_req_path = format!(
         "/org/freedesktop/portal/desktop/request/{}/{}",
         conn.conn.unique_name()[1..].replace(".", "_"),
         request_token
     );
 
+    // Note that we do *not* register a match rule with the message bus. The
+    // Response signal is unicast, so we don't need to do that. We're just telling
+    // the Connection2 to hold on to the message for us when it is received.
     let response_matcher = dbus_util::Matcher::new()
         .with_message_type(dbus::MessageType::Signal)
         .with_path(predicted_req_path)
@@ -94,7 +97,7 @@ fn get_portal_response(
         return Err(anyhow!("Got error reply: {reply_msg:?}"));
     }
 
-    // ... however, this mechanism didn't exist in all versions of the Desktop Portal
+    // (1)... however, this mechanism didn't exist in all versions of the Desktop Portal
     // specification. Previously, callers relied on the method call returning the Request
     // handle *before* the Response signal fires. We maintain compatibility with this
     // mechanism by modifying our signal matcher here. Note that this doesn't help
@@ -124,11 +127,8 @@ fn get_dbus_reply(
 ) -> Result<dbus::Message, anyhow::Error> {
     let matcher = dbus_util::Matcher::new().with_reply_serial(serial);
     let id = conn.register_matcher(1, matcher);
-    let res_msg = conn
-        .block_on_once_matcher_remove(id, timeout)?
-        .1
-        .ok_or(anyhow!("Timed out waiting for reply"))?;
-    Ok(res_msg)
+    let (_, reply) = conn.block_on_once_matcher_remove(id, timeout)?;
+    reply.ok_or(anyhow!("Timed out waiting fo reply"))
 }
 
 fn get_pipewire_stream(conn: &mut dbus_util::Connection2) -> Result<(u32, OwnedFd), anyhow::Error> {
