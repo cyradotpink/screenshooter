@@ -4,7 +4,6 @@ mod dbus_util;
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -26,6 +25,14 @@ mod source_types {
     pub const MONITOR: u32 = 1;
     pub const WINDOW: u32 = 2;
     pub const VIRTUAL: u32 = 4;
+    pub const ALL: u32 = MONITOR | WINDOW | VIRTUAL;
+}
+#[allow(unused)]
+mod device_types {
+    pub const KEYBOARD: u32 = 1;
+    pub const POINTER: u32 = 2;
+    pub const TOUCHSCREEN: u32 = 4;
+    pub const ALL: u32 = KEYBOARD | POINTER | TOUCHSCREEN;
 }
 
 struct DbusBoxDynMapBuilder(DbusBoxDynMap);
@@ -37,19 +44,31 @@ impl DbusBoxDynMapBuilder {
         self.0.insert(key, dbus::arg::Variant(Box::new(value)));
         self
     }
-    fn build(self) -> DbusBoxDynMap {
+    fn take(self) -> DbusBoxDynMap {
         self.0
     }
 }
 
-fn new_screen_cast_call(method: &str) -> Result<dbus::Message, anyhow::Error> {
+// Panics if memory can't be allocated for the message
+fn new_screen_cast_call(method: &str) -> dbus::Message {
     dbus::Message::new_method_call(
         "org.freedesktop.portal.Desktop",
         "/org/freedesktop/portal/desktop",
         "org.freedesktop.portal.ScreenCast",
         method,
     )
-    .map_err(|e| anyhow!(e))
+    .unwrap()
+}
+
+// Panics if memory can't be allocated for the message
+fn new_remote_desktop_call(method: &str) -> dbus::Message {
+    dbus::Message::new_method_call(
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.RemoteDesktop",
+        method,
+    )
+    .unwrap()
 }
 
 fn array_to_dynmap<'a>(
@@ -131,46 +150,104 @@ fn get_dbus_reply(
     reply.ok_or(anyhow!("Timed out waiting fo reply"))
 }
 
-fn get_pipewire_stream(conn: &mut dbus_util::Connection2) -> Result<(u32, OwnedFd), anyhow::Error> {
+#[allow(unused)]
+fn remote_desktop_type(
+    conn: &mut dbus_util::Connection2,
+    session_handle: &dbus::Path,
+    text: &str,
+) -> Result<(), anyhow::Error> {
+    for ch in text.chars() {
+        let mut call = new_remote_desktop_call("NotifyKeyboardKeysym");
+        call.append_all((session_handle, DbusBoxDynMap::new(), ch as i32, 1u32));
+        let serial = conn.send(call)?;
+        get_dbus_reply(conn, serial, Duration::from_secs(1))?;
+        let mut call = new_remote_desktop_call("NotifyKeyboardKeysym");
+        call.append_all((session_handle, DbusBoxDynMap::new(), ch as i32, 0u32));
+        let serial = conn.send(call)?;
+        get_dbus_reply(conn, serial, Duration::from_secs(1))?;
+    }
+    Ok(())
+}
+
+type MakeCallFn = fn(&str) -> dbus::Message;
+
+fn create_portal_session(
+    conn: &mut dbus_util::Connection2,
+    make_call: MakeCallFn,
+) -> Result<dbus::Path<'static>, anyhow::Error> {
     let token = conn.get_token();
     let req_options = DbusBoxDynMapBuilder::new()
         .with_owned("handle_token".to_owned(), token.to_string())
-        .with_owned("session_handle_token".to_owned(), "session0".to_owned())
-        .build();
-    let req_msg = new_screen_cast_call("CreateSession")?.append1(req_options);
-    let serial = conn
-        .send(req_msg)
-        .map_err(|_| anyhow!("Failed to send message"))?;
+        .with_owned(
+            "session_handle_token".to_owned(),
+            conn.get_token().to_string(),
+        )
+        .take();
+    let req_msg = make_call("CreateSession").append1(req_options);
+    let serial = conn.send(req_msg)?;
     let results = get_portal_response(conn, serial, &token.to_string(), Duration::from_secs(1))?;
     let session_handle = results
         .get("session_handle")
         .and_then(|v| v.as_str())
         .ok_or(anyhow!("no session handle in response"))?;
-    let session_handle = dbus::Path::from_slice(session_handle).map_err(|e| anyhow!(e))?;
+    dbus::Path::new(session_handle).map_err(|e| anyhow!(e))
+}
 
+fn start_portal_session(
+    conn: &mut dbus_util::Connection2,
+    session_handle: &dbus::Path,
+    make_call: MakeCallFn,
+) -> Result<DbusBoxDynMap, anyhow::Error> {
     let token = conn.get_token();
     let req_options = DbusBoxDynMapBuilder::new()
         .with_owned("handle_token".to_owned(), token.to_string())
-        .with_owned(
-            "types".to_owned(),
-            source_types::MONITOR | source_types::WINDOW | source_types::VIRTUAL,
-        )
-        .build();
-    let req_msg = new_screen_cast_call("SelectSources")?.append2(&session_handle, req_options);
-    let serial = conn
-        .send(req_msg)
-        .map_err(|_| anyhow!("Failed to send message"))?;
-    let _results = get_portal_response(conn, serial, &token.to_string(), Duration::from_secs(1))?;
+        .take();
+    let req_msg = make_call("Start").append3(session_handle, "", req_options);
+    let serial = conn.send(req_msg)?;
+    get_portal_response(conn, serial, &token.to_string(), Duration::from_secs(300))
+}
 
+fn screen_cast_select_sources(
+    conn: &mut dbus_util::Connection2,
+    session_handle: &dbus::Path,
+    source_types: u32,
+) -> Result<(), anyhow::Error> {
     let token = conn.get_token();
     let req_options = DbusBoxDynMapBuilder::new()
         .with_owned("handle_token".to_owned(), token.to_string())
-        .build();
-    let req_msg = new_screen_cast_call("Start")?.append3(&session_handle, "", req_options);
-    let serial = conn
-        .send(req_msg)
-        .map_err(|_| anyhow!("Failed to send message"))?;
-    let results = get_portal_response(conn, serial, &token.to_string(), Duration::from_secs(300))?;
+        .with_owned("types".to_owned(), source_types)
+        .take();
+    let req_msg = new_screen_cast_call("SelectSources").append2(session_handle, req_options);
+    let serial = conn.send(req_msg)?;
+    get_portal_response(conn, serial, &token.to_string(), Duration::from_secs(1)).map(|_| ())
+}
+
+fn remote_desktop_select_devices(
+    conn: &mut dbus_util::Connection2,
+    session_handle: &dbus::Path,
+    device_types: u32,
+) -> Result<(), anyhow::Error> {
+    let token = conn.get_token();
+    let req_options = DbusBoxDynMapBuilder::new()
+        .with_owned("handle_token".to_owned(), token.to_string())
+        .with_owned("types".to_owned(), device_types)
+        .take();
+    let req_msg = new_remote_desktop_call("SelectDevices").append2(session_handle, req_options);
+    let serial = conn.send(req_msg)?;
+    get_portal_response(conn, serial, &token.to_string(), Duration::from_secs(1)).map(|_| ())
+}
+
+fn screen_cast_open_pipe_wire_remote(
+    conn: &mut dbus_util::Connection2,
+    session_handle: &dbus::Path,
+) -> Result<dbus::Message, anyhow::Error> {
+    let req_msg =
+        new_screen_cast_call("OpenPipeWireRemote").append2(session_handle, DbusBoxDynMap::new());
+    let serial = conn.send(req_msg)?;
+    get_dbus_reply(conn, serial, Duration::from_secs(1))
+}
+
+fn extract_pipewire_stream_node(results: &DbusBoxDynMap) -> Result<u32, anyhow::Error> {
     let stream: Option<_> = try {
         results
             .get("streams")?
@@ -190,15 +267,27 @@ fn get_pipewire_stream(conn: &mut dbus_util::Connection2) -> Result<(u32, OwnedF
         .and_then(|v| v.as_iter())
         .and_then(array_to_dynmap)
         .ok_or(anyhow!("no properties in stream tuple"))?;
+    Ok(node_id)
+}
 
-    let req_msg =
-        new_screen_cast_call("OpenPipeWireRemote")?.append2(&session_handle, DbusBoxDynMap::new());
-    let serial = conn
-        .send(req_msg)
-        .map_err(|_| anyhow!("Failed to send message"))?;
-    let res_msg = get_dbus_reply(conn, serial, Duration::from_secs(1))?;
-    let file: std::fs::File = res_msg.get1().ok_or(anyhow!("no fd in return"))?;
-    Ok((node_id, file.into()))
+fn init_screen_cast_session(
+    conn: &mut dbus_util::Connection2,
+    source_types: u32,
+    device_types: Option<u32>,
+) -> Result<(dbus::Path<'static>, u32), anyhow::Error> {
+    let new_call = if device_types.is_some() {
+        new_remote_desktop_call
+    } else {
+        new_screen_cast_call
+    };
+    let session_handle = create_portal_session(conn, new_call)?;
+    if let Some(device_types) = device_types {
+        remote_desktop_select_devices(conn, &session_handle, device_types)?;
+    }
+    screen_cast_select_sources(conn, &session_handle, source_types)?;
+    let results = start_portal_session(conn, &session_handle, new_call)?;
+    let node_id = extract_pipewire_stream_node(&results)?;
+    Ok((session_handle, node_id))
 }
 
 #[derive(Debug, Clone)]
@@ -228,7 +317,6 @@ struct UserData {
 
 #[allow(unused)]
 struct ScreenshooterSetup {
-    dbus_conn: dbus_util::Connection2,
     pw_loop: pipewire::main_loop::MainLoop,
     pw_ctx: pipewire::context::Context,
     pw_core: pipewire::core::Core,
@@ -237,16 +325,18 @@ struct ScreenshooterSetup {
 }
 impl ScreenshooterSetup {
     fn new(
+        dbus_conn: &mut dbus_util::Connection2,
+        session_handle: &dbus::Path,
+        node_id: u32,
         latest_frame: Arc<Mutex<LatestFrame>>,
         quit: Arc<AtomicBool>,
     ) -> Result<Self, anyhow::Error> {
-        let dbus_conn = dbus::blocking::Connection::new_session()?;
-        let mut dbus_conn = dbus_util::Connection2::new(dbus_conn);
-        let (node_id, fd) = get_pipewire_stream(&mut dbus_conn)?;
+        let res_msg = screen_cast_open_pipe_wire_remote(dbus_conn, session_handle)?;
+        let file: std::fs::File = res_msg.get1().ok_or(anyhow!("no fd in return"))?;
 
         let pw_loop = pipewire::main_loop::MainLoop::new(None)?;
         let pw_ctx = pipewire::context::Context::new(&pw_loop)?;
-        let pw_core = pw_ctx.connect_fd(fd, None)?;
+        let pw_core = pw_ctx.connect_fd(file.into(), None)?;
         let pw_stream = pipewire::stream::Stream::new(
             &pw_core,
             "capture",
@@ -344,7 +434,6 @@ impl ScreenshooterSetup {
         )?;
 
         Ok(Self {
-            dbus_conn,
             pw_loop,
             pw_ctx,
             pw_core,
@@ -356,13 +445,21 @@ impl ScreenshooterSetup {
 
 #[allow(unused)]
 struct Screenshooter {
+    dbus_conn: dbus_util::Connection2,
+    session_handle: dbus::Path<'static>,
     handle: thread::JoinHandle<()>,
     latest_frame: Arc<Mutex<LatestFrame>>,
     quit: Arc<AtomicBool>,
     quit_notify: Arc<Mutex<HashMap<thread::ThreadId, thread::Thread>>>,
 }
 impl Screenshooter {
-    fn new() -> Result<Self, anyhow::Error> {
+    fn new(source_types: u32, device_types: Option<u32>) -> Result<Self, anyhow::Error> {
+        let dbus_conn = dbus::blocking::Connection::new_session()?;
+        let mut dbus_conn = dbus_util::Connection2::new(dbus_conn);
+        let (session_handle, node_id) =
+            init_screen_cast_session(&mut dbus_conn, source_types, device_types)?;
+        let dbus_conn = Arc::new(Mutex::new(dbus_conn));
+
         let latest_frame = Arc::new(Mutex::new(LatestFrame {
             data: Vec::new(),
             info: spa::param::video::VideoInfoRaw::default(),
@@ -375,6 +472,8 @@ impl Screenshooter {
         let init = Arc::new(OnceLock::<Result<(), anyhow::Error>>::new());
 
         let thread_data = (
+            dbus_conn.clone(),
+            session_handle.clone(),
             latest_frame.clone(),
             quit.clone(),
             quit_notify.clone(),
@@ -382,14 +481,24 @@ impl Screenshooter {
             thread::current(),
         );
         let handle = thread::spawn(move || {
-            let (latest_frame, quit, quit_notify, init, spawning_thread) = thread_data;
-            let setup_result = ScreenshooterSetup::new(latest_frame, quit.clone());
+            let (dbus_conn, session_handle, latest_frame, quit, quit_notify, init, spawning_thread) =
+                thread_data;
+            let mut dbus_conn_lock = dbus_conn.try_lock().unwrap();
+            let setup_result = ScreenshooterSetup::new(
+                &mut dbus_conn_lock,
+                &session_handle,
+                node_id,
+                latest_frame,
+                quit.clone(),
+            );
+            drop(dbus_conn_lock);
             let (ok, init_result) = match setup_result {
                 Ok(v) => (Some(v), Ok(())),
                 Err(e) => (None, Err(e)),
             };
             let _ = init.set(init_result);
             drop(init);
+            drop(dbus_conn);
             spawning_thread.unpark();
             let setup = match ok {
                 Some(v) => Rc::new(v),
@@ -413,8 +522,11 @@ impl Screenshooter {
         // Unwraps are okay because 1. the Arc is never cloned again after the spawned thread
         // drops its reference and 2. it only drops its reference after initialising the result
         Arc::into_inner(init).unwrap().into_inner().unwrap()?;
+        let dbus_conn = Arc::into_inner(dbus_conn).unwrap().into_inner().unwrap();
 
         Ok(Self {
+            dbus_conn,
+            session_handle,
             handle,
             latest_frame,
             quit,
@@ -460,9 +572,8 @@ fn park_until_quit_w_timeout(shooter: &Screenshooter, mut timeout: Duration) -> 
 // Let the user select a window to capture, then try to grab the latest captured frame every 5 seconds
 // and save it as screenshot.png.
 fn main() -> Result<(), anyhow::Error> {
-    let shooter = Screenshooter::new()?;
+    let shooter = Screenshooter::new(source_types::ALL, None)?;
     shooter.reqister_quit_notify(thread::current());
-
     while !shooter.is_quit() {
         let mut frame = shooter.latest_frame.lock().unwrap().take();
         if frame.data.is_empty() {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use anyhow::anyhow;
 use dbus::channel::Sender;
 use dbus::{Message, MessageType, blocking::Connection};
 
@@ -78,8 +79,10 @@ impl Connection2 {
         self.next_token += 1;
         token
     }
-    pub fn send(&self, message: Message) -> Result<u32, ()> {
-        self.conn.send(message)
+    pub fn send(&self, message: Message) -> Result<u32, anyhow::Error> {
+        self.conn
+            .send(message)
+            .map_err(|_| anyhow!("Failed to send message"))
     }
     pub fn register_matcher(&mut self, n: usize, matcher: Matcher) -> usize {
         let id = self.get_matcher_id();
